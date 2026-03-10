@@ -10,6 +10,7 @@ from transformers import pipeline
 
 from neo4j import GraphDatabase
 import spacy
+from spacy.pipeline import EntityRuler
 
 
 # =========================
@@ -18,28 +19,46 @@ import spacy
 
 INDEX_PATH = "../data/faiss_index"
 
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
 
-reranker = CrossEncoder(
-    "cross-encoder/ms-marco-MiniLM-L-6-v2"
-)
+# =========================
+# LAZY MODEL LOADING
+# =========================
 
-generator = pipeline(
-    "text2text-generation",
-    model="google/flan-t5-base",
-    max_new_tokens=120
-)
+embedding_model = None
+reranker = None
+generator = None
+
+
+def load_models():
+    global embedding_model, reranker, generator
+
+    if embedding_model is None:
+
+        print("Loading embedding model...")
+        embedding_model = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+        print("Loading reranker...")
+        reranker = CrossEncoder(
+            "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        )
+
+        print("Loading generator...")
+        generator = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-base",
+            max_new_tokens=120
+        )
 
 
 # =========================
 # GRAPH CONFIG
 # =========================
 
-URI = "neo4j://127.0.0.1:7687"
-USERNAME = "neo4j"
-PASSWORD = "YOUR_PASSWORD"   # ← change this
+URI = os.getenv("NEO4J_URI", "neo4j://127.0.0.1:7687")
+USERNAME = os.getenv("NEO4J_USER", "neo4j")
+PASSWORD = os.getenv("NEO4J_PASSWORD", "12345678")
 
 driver = GraphDatabase.driver(
     URI,
@@ -51,6 +70,7 @@ driver = GraphDatabase.driver(
 # NLP MODEL
 # =========================
 
+print("Loading spaCy model...")
 nlp = spacy.load("en_core_web_sm")
 
 
@@ -69,7 +89,6 @@ MARITIME_TERMS = [
     "Vessel Traffic Service"
 ]
 
-from spacy.pipeline import EntityRuler
 
 ruler = nlp.add_pipe("entity_ruler", before="ner")
 
@@ -100,7 +119,6 @@ bm25 = None
 def preprocess_query(query):
 
     query = query.lower()
-
     query = re.sub(r"[^\w\s]", "", query)
 
     return query
@@ -161,7 +179,7 @@ def expand_query_with_graph(query):
 
         expanded_terms.extend(related)
 
-    if len(expanded_terms) > 0:
+    if expanded_terms:
 
         query = query + " " + " ".join(expanded_terms)
 
@@ -175,6 +193,8 @@ def expand_query_with_graph(query):
 def load_documents():
 
     global vector_store, documents, bm25
+
+    load_models()
 
     print("Loading FAISS index...")
 
@@ -201,15 +221,14 @@ def load_documents():
 
 def retrieve(query, top_k=5):
 
+    load_models()
+
     query = preprocess_query(query)
 
-    # GRAPH QUERY EXPANSION
     query = expand_query_with_graph(query)
 
     tokenized_query = query.split()
 
-
-    # BM25 retrieval
     bm25_scores = bm25.get_scores(tokenized_query)
 
     bm25_ids = sorted(
@@ -220,15 +239,11 @@ def retrieve(query, top_k=5):
 
     bm25_docs = [documents[i] for i in bm25_ids]
 
-
-    # Dense retrieval
     dense_docs = vector_store.similarity_search(
         query,
         k=top_k * 3
     )
 
-
-    # Combine results
     candidates = bm25_docs + dense_docs
 
     unique = []
@@ -241,11 +256,8 @@ def retrieve(query, top_k=5):
         if text not in seen:
 
             seen.add(text)
-
             unique.append(doc)
 
-
-    # Reranking
     pairs = [(query, d.page_content) for d in unique]
 
     scores = reranker.predict(pairs)
@@ -258,19 +270,16 @@ def retrieve(query, top_k=5):
 
     results = ranked[:top_k]
 
-
     contexts = []
 
     for rank, (score, doc) in enumerate(results):
 
         contexts.append({
-
             "rank": rank + 1,
             "source": os.path.basename(doc.metadata.get("source", "")),
             "page": doc.metadata.get("page", ""),
             "score": float(score),
             "text": doc.page_content
-
         })
 
     return contexts
@@ -281,6 +290,8 @@ def retrieve(query, top_k=5):
 # =========================
 
 def generate_answer(question, contexts):
+
+    load_models()
 
     contexts = contexts[:3]
 
