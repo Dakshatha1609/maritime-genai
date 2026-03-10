@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+neo4j
+spacy
+rank-bm25
+sentence-transformers
+transformers
+torch
+langchain
+langchain-community
+faiss-cpu
+python-multipart
